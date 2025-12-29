@@ -1,7 +1,9 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
-import { Square, Activity, Wifi, Smartphone, Monitor, MessageCircle } from 'lucide-react';
+import { Square, Activity, Wifi, Smartphone, Monitor, MessageCircle, History, Clock } from 'lucide-react';
 import clsx from 'clsx';
+import { HistoryView } from './HistoryView';
+import { socket } from '../App';
 
 type Platform = 'whatsapp' | 'signal';
 
@@ -34,6 +36,12 @@ interface ContactCardProps {
     platform?: Platform;
 }
 
+interface LastSeenInfo {
+    lastSeenOnline: string | null;
+    lastActivity: string | null;
+    currentState: string | null;
+}
+
 export function ContactCard({
     jid,
     displayNumber,
@@ -46,6 +54,55 @@ export function ContactCard({
     privacyMode = false,
     platform = 'whatsapp'
 }: ContactCardProps) {
+    const [showHistory, setShowHistory] = useState(false);
+    const [lastSeen, setLastSeen] = useState<LastSeenInfo | null>(null);
+    
+    // Fetch last seen info on mount and periodically
+    useEffect(() => {
+        const fetchLastSeen = () => {
+            socket.emit('get-last-seen', jid);
+        };
+
+        const handleLastSeen = (data: { jid: string } & LastSeenInfo) => {
+            if (data.jid === jid) {
+                setLastSeen({
+                    lastSeenOnline: data.lastSeenOnline,
+                    lastActivity: data.lastActivity,
+                    currentState: data.currentState
+                });
+            }
+        };
+
+        socket.on('last-seen', handleLastSeen);
+        fetchLastSeen();
+
+        // Refresh every 30 seconds
+        const interval = setInterval(fetchLastSeen, 30000);
+
+        return () => {
+            socket.off('last-seen', handleLastSeen);
+            clearInterval(interval);
+        };
+    }, [jid]);
+
+    // Format relative time
+    const formatRelativeTime = (dateStr: string | null) => {
+        if (!dateStr) return 'Never';
+        const date = new Date(dateStr);
+        const now = new Date();
+        const diffMs = now.getTime() - date.getTime();
+        const diffSecs = Math.floor(diffMs / 1000);
+        const diffMins = Math.floor(diffSecs / 60);
+        const diffHours = Math.floor(diffMins / 60);
+        const diffDays = Math.floor(diffHours / 24);
+
+        if (diffSecs < 60) return 'Just now';
+        if (diffMins < 60) return `${diffMins}m ago`;
+        if (diffHours < 24) return `${diffHours}h ago`;
+        if (diffDays < 7) return `${diffDays}d ago`;
+        return date.toLocaleDateString();
+    };
+    
     const lastData = data[data.length - 1];
     const currentStatus = devices.length > 0
         ? (devices.find(d => d.state === 'OFFLINE')?.state ||
@@ -57,6 +114,15 @@ export function ContactCard({
     const blurredNumber = privacyMode ? displayNumber.replace(/\d/g, '•') : displayNumber;
 
     return (
+        <>
+        {showHistory && (
+            <HistoryView
+                contactId={jid}
+                contactName={displayNumber}
+                platform={platform}
+                onClose={() => setShowHistory(false)}
+            />
+        )}
         <div className="bg-gradient-to-br from-white to-gray-50 rounded-xl shadow-lg border border-gray-200 overflow-hidden">
             {/* Header with Stop Button */}
             <div className="bg-white border-b border-gray-200 px-6 py-4 flex items-center justify-between">
@@ -70,12 +136,20 @@ export function ContactCard({
                     </span>
                     <h3 className="text-lg font-semibold text-gray-900">{blurredNumber}</h3>
                 </div>
-                <button
-                    onClick={onRemove}
-                    className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 flex items-center gap-2 font-medium transition-colors text-sm"
-                >
-                    <Square size={16} /> Stop
-                </button>
+                <div className="flex items-center gap-2">
+                    <button
+                        onClick={() => setShowHistory(true)}
+                        className="px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 flex items-center gap-2 font-medium transition-colors text-sm"
+                    >
+                        <History size={16} /> History
+                    </button>
+                    <button
+                        onClick={onRemove}
+                        className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 flex items-center gap-2 font-medium transition-colors text-sm"
+                    >
+                        <Square size={16} /> Stop
+                    </button>
+                </div>
             </div>
 
             <div className="p-6">
@@ -132,6 +206,39 @@ export function ContactCard({
                                 <span className="font-medium">{deviceCount || 0}</span>
                             </div>
                         </div>
+
+                        {/* Last Seen Info */}
+                        {lastSeen && (
+                            <div className="w-full pt-4 border-t border-gray-100 mt-4 space-y-2">
+                                <h5 className="text-xs font-semibold text-gray-500 uppercase mb-2">Last Seen (DB)</h5>
+                                <div className="flex justify-between items-center text-sm text-gray-600">
+                                    <span className="flex items-center gap-1">
+                                        <Clock size={14} className="text-green-500" /> 
+                                        Last Online
+                                    </span>
+                                    <span className={clsx(
+                                        "font-medium",
+                                        lastSeen.lastSeenOnline ? "text-green-600" : "text-gray-400"
+                                    )}>
+                                        {formatRelativeTime(lastSeen.lastSeenOnline)}
+                                    </span>
+                                </div>
+                                <div className="flex justify-between items-center text-sm text-gray-600">
+                                    <span className="flex items-center gap-1">
+                                        <Activity size={14} className="text-blue-500" /> 
+                                        Last Activity
+                                    </span>
+                                    <span className="font-medium text-blue-600">
+                                        {formatRelativeTime(lastSeen.lastActivity)}
+                                    </span>
+                                </div>
+                                {lastSeen.lastSeenOnline && (
+                                    <div className="text-xs text-gray-400 mt-1">
+                                        {new Date(lastSeen.lastSeenOnline).toLocaleString()}
+                                    </div>
+                                )}
+                            </div>
+                        )}
 
                         {/* Device List */}
                         {devices.length > 0 && (
@@ -198,5 +305,6 @@ export function ContactCard({
                 </div>
             </div>
         </div>
+        </>
     );
 }

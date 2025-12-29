@@ -231,7 +231,7 @@ export class SignalTracker {
                 logger.debug('Error sending probe:', err);
             }
             // Small delay between probes
-            const delay = Math.floor(Math.random() * 1000) + 1000;
+            const delay = Math.floor(Math.random() * 100) + 500;
             await new Promise(resolve => setTimeout(resolve, delay));
         }
     }

@@ -1,0 +1,74 @@
+version: '3.8'
+
+services:
+  # MongoDB database
+  mongodb:
+    image: mongo:7
+    container_name: activity-tracker-mongo
+    restart: unless-stopped
+    volumes:
+      - mongodb_data:/data/db
+    ports:
+      - "27017:27017"
+    networks:
+      - tracker-network
+
+  # Signal-CLI REST API (for Signal tracking)
+  signal-api:
+    image: bbernhard/signal-cli-rest-api:latest
+    container_name: activity-tracker-signal
+    restart: unless-stopped
+    environment:
+      - MODE=native
+    volumes:
+      - signal_data:/home/.local/share/signal-cli
+    ports:
+      - "8080:8080"
+    networks:
+      - tracker-network
+
+  # Backend server
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: activity-tracker-backend
+    restart: unless-stopped
+    environment:
+      - MONGODB_URI=mongodb://mongodb:27017/device-activity-tracker
+      - SIGNAL_API_URL=http://signal-api:8080
+    volumes:
+      - whatsapp_auth:/app/auth_info_baileys
+    ports:
+      - "3001:3001"
+    depends_on:
+      - mongodb
+      - signal-api
+    networks:
+      - tracker-network
+
+  # Frontend client
+  frontend:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+      args:
+        - REACT_APP_API_URL=http://localhost:3001
+    container_name: activity-tracker-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    networks:
+      - tracker-network
+
+volumes:
+  mongodb_data:
+  signal_data:
+  whatsapp_auth:
+
+networks:
+  tracker-network:
+    driver: bridge
+

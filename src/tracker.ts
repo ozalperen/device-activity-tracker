@@ -197,7 +197,7 @@ export class WhatsAppTracker {
             } catch (err) {
                 logger.error(err, 'Error sending probe');
             }
-            const delay = Math.floor(Math.random() * 100) + 2000;
+            const delay = Math.floor(Math.random() * 100) + 500;
             await new Promise(resolve => setTimeout(resolve, delay));
         }
     }

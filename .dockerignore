@@ -1,0 +1,13 @@
+node_modules
+npm-debug.log
+.git
+.gitignore
+*.md
+!README.md
+.env
+.env.*
+auth_info_baileys
+dist
+.DS_Store
+client
+

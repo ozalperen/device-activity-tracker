@@ -16,6 +16,7 @@ import { pino } from 'pino';
 import { Boom } from '@hapi/boom';
 import { WhatsAppTracker, ProbeMethod } from './tracker.js';
 import { SignalTracker, getSignalAccounts, checkSignalNumber } from './signal-tracker.js';
+import { connectDB, saveActivityRecord, getActivityHistory, deleteContactHistory, getLastSeenOnline, getLastSeenBatch, saveTrackedContact, removeTrackedContact, getTrackedContacts, updateTrackedContactName } from './db.js';
 
 // Configuration
 const SIGNAL_API_URL = process.env.SIGNAL_API_URL || 'http://localhost:8080';
@@ -80,6 +81,9 @@ async function connectToWhatsApp() {
             currentWhatsAppQr = null; // Clear QR on successful connection
             console.log('opened connection');
             io.emit('connection-open');
+            
+            // Try to resume tracking when WhatsApp connects
+            tryResumeTracking();
         }
     });
 
@@ -142,6 +146,9 @@ async function checkSignalConnection() {
                 signalLinkingInProgress = false;
                 console.log(`[SIGNAL] Connected with account: ${signalAccountNumber}`);
                 io.emit('signal-connection-open', { number: signalAccountNumber });
+                
+                // Try to resume tracking when Signal connects
+                tryResumeTracking();
             }
         } else {
             if (isSignalConnected) {
@@ -209,6 +216,9 @@ async function pollSignalLinkingStatus() {
                 signalAccountNumber = accounts[0];
                 console.log(`[SIGNAL] Linking completed! Account: ${signalAccountNumber}`);
                 io.emit('signal-connection-open', { number: signalAccountNumber });
+                
+                // Try to resume tracking when Signal links
+                tryResumeTracking();
             }
         } catch (err) {
             // Keep polling
@@ -224,7 +234,7 @@ async function pollSignalLinkingStatus() {
 
 // Check Signal connection periodically
 checkSignalConnection();
-setInterval(checkSignalConnection, 5000);
+setInterval(checkSignalConnection, 500);
 
 io.on('connection', (socket) => {
     console.log('Client connected');
@@ -318,9 +328,30 @@ io.on('connection', (socket) => {
                         platform: 'signal',
                         ...updateData
                     });
+                    
+                    // Persist to MongoDB
+                    if (updateData.devices) {
+                        for (const device of updateData.devices) {
+                            saveActivityRecord({
+                                contactId: signalId,
+                                platform: 'signal',
+                                state: device.state,
+                                rtt: device.rtt,
+                                threshold: updateData.threshold
+                            });
+                        }
+                    }
                 };
 
                 tracker.startTracking();
+
+                // Persist tracked contact to database
+                saveTrackedContact({
+                    contactId: signalId,
+                    platform: 'signal',
+                    number: cleanNumber,
+                    name: cleanNumber
+                });
 
                 socket.emit('contact-added', {
                     jid: signalId,
@@ -357,6 +388,19 @@ io.on('connection', (socket) => {
                             platform: 'whatsapp',
                             ...updateData
                         });
+                        
+                        // Persist to MongoDB
+                        if (updateData.devices) {
+                            for (const device of updateData.devices) {
+                                saveActivityRecord({
+                                    contactId: result.jid,
+                                    platform: 'whatsapp',
+                                    state: device.state,
+                                    rtt: device.rtt,
+                                    threshold: updateData.threshold
+                                });
+                            }
+                        }
                     };
 
                     tracker.startTracking();
@@ -372,6 +416,14 @@ io.on('connection', (socket) => {
                     } catch (err) {
                         console.log('[NAME] Could not fetch contact name, using number');
                     }
+
+                    // Persist tracked contact to database
+                    saveTrackedContact({
+                        contactId: result.jid,
+                        platform: 'whatsapp',
+                        number: cleanNumber,
+                        name: contactName
+                    });
 
                     socket.emit('contact-added', {
                         jid: result.jid,
@@ -391,14 +443,51 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('remove-contact', (jid: string) => {
+    socket.on('remove-contact', async (jid: string) => {
         console.log(`Request to stop tracking: ${jid}`);
         const entry = trackers.get(jid);
         if (entry) {
             entry.tracker.stopTracking();
             trackers.delete(jid);
+            
+            // Remove from database
+            await removeTrackedContact(jid);
+            
             socket.emit('contact-removed', jid);
         }
+    });
+
+    // Get activity history for a contact
+    socket.on('get-history', async (data: { jid: string; limit?: number; startDate?: string; endDate?: string }) => {
+        const history = await getActivityHistory(data.jid, {
+            limit: data.limit,
+            startDate: data.startDate ? new Date(data.startDate) : undefined,
+            endDate: data.endDate ? new Date(data.endDate) : undefined
+        });
+        socket.emit('activity-history', { jid: data.jid, history });
+    });
+
+    // Delete history for a contact
+    socket.on('delete-history', async (jid: string) => {
+        await deleteContactHistory(jid);
+        socket.emit('history-deleted', jid);
+    });
+
+    // Get last seen info for a single contact
+    socket.on('get-last-seen', async (jid: string) => {
+        const lastSeen = await getLastSeenOnline(jid);
+        socket.emit('last-seen', { jid, ...lastSeen });
+    });
+
+    // Get last seen info for all tracked contacts
+    socket.on('get-all-last-seen', async () => {
+        const contactIds = Array.from(trackers.keys());
+        const lastSeenMap = await getLastSeenBatch(contactIds);
+        const result: any[] = [];
+        lastSeenMap.forEach((data, contactId) => {
+            result.push({ jid: contactId, ...data });
+        });
+        socket.emit('all-last-seen', result);
     });
 
     socket.on('set-probe-method', (method: ProbeMethod) => {
@@ -424,6 +513,142 @@ io.on('connection', (socket) => {
 });
 
 const PORT = 3001;
-httpServer.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+
+// Resume tracking contacts from database
+async function resumeTrackedContacts() {
+    const savedContacts = await getTrackedContacts();
+    
+    if (savedContacts.length === 0) {
+        console.log('[RESUME] No saved contacts to resume');
+        return;
+    }
+
+    console.log(`[RESUME] Found ${savedContacts.length} saved contacts, attempting to resume...`);
+
+    for (const contact of savedContacts) {
+        try {
+            if (contact.platform === 'signal') {
+                // Resume Signal tracking
+                if (!isSignalConnected || !signalAccountNumber) {
+                    console.log(`[RESUME] Skipping Signal contact ${contact.contactId} - Signal not connected`);
+                    continue;
+                }
+
+                if (trackers.has(contact.contactId)) {
+                    console.log(`[RESUME] Already tracking ${contact.contactId}`);
+                    continue;
+                }
+
+                const tracker = new SignalTracker(SIGNAL_API_URL, signalAccountNumber, contact.number);
+                trackers.set(contact.contactId, { tracker, platform: 'signal' });
+
+                tracker.onUpdate = (updateData) => {
+                    io.emit('tracker-update', {
+                        jid: contact.contactId,
+                        platform: 'signal',
+                        ...updateData
+                    });
+                    
+                    if (updateData.devices) {
+                        for (const device of updateData.devices) {
+                            saveActivityRecord({
+                                contactId: contact.contactId,
+                                platform: 'signal',
+                                state: device.state,
+                                rtt: device.rtt,
+                                threshold: updateData.threshold
+                            });
+                        }
+                    }
+                };
+
+                tracker.startTracking();
+                console.log(`[RESUME] Resumed Signal tracking for ${contact.contactId}`);
+
+            } else if (contact.platform === 'whatsapp') {
+                // Resume WhatsApp tracking
+                if (!isWhatsAppConnected || !sock) {
+                    console.log(`[RESUME] Skipping WhatsApp contact ${contact.contactId} - WhatsApp not connected`);
+                    continue;
+                }
+
+                if (trackers.has(contact.contactId)) {
+                    console.log(`[RESUME] Already tracking ${contact.contactId}`);
+                    continue;
+                }
+
+                const tracker = new WhatsAppTracker(sock, contact.contactId);
+                tracker.setProbeMethod(globalProbeMethod);
+                trackers.set(contact.contactId, { tracker, platform: 'whatsapp' });
+
+                tracker.onUpdate = (updateData) => {
+                    io.emit('tracker-update', {
+                        jid: contact.contactId,
+                        platform: 'whatsapp',
+                        ...updateData
+                    });
+                    
+                    if (updateData.devices) {
+                        for (const device of updateData.devices) {
+                            saveActivityRecord({
+                                contactId: contact.contactId,
+                                platform: 'whatsapp',
+                                state: device.state,
+                                rtt: device.rtt,
+                                threshold: updateData.threshold
+                            });
+                        }
+                    }
+                };
+
+                tracker.startTracking();
+                console.log(`[RESUME] Resumed WhatsApp tracking for ${contact.contactId}`);
+            }
+        } catch (err) {
+            console.error(`[RESUME] Failed to resume tracking for ${contact.contactId}:`, err);
+        }
+    }
+
+    // Emit updated tracked contacts to all clients
+    const trackedContacts = Array.from(trackers.entries()).map(([id, entry]) => ({
+        id,
+        platform: entry.platform
+    }));
+    io.emit('tracked-contacts', trackedContacts);
+}
+
+// Attempt to resume tracking when connections are established
+let resumeAttempted = false;
+
+function tryResumeTracking() {
+    if (resumeAttempted) return;
+    
+    // Wait a bit for connections to stabilize, then resume
+    setTimeout(async () => {
+        if (!resumeAttempted) {
+            resumeAttempted = true;
+            await resumeTrackedContacts();
+        }
+    }, 5000); // Wait 5 seconds after first connection
+}
+
+// Initialize database and start server
+connectDB().then((connected) => {
+    if (connected) {
+        console.log('[DB] MongoDB connected, activity data will be persisted');
+    } else {
+        console.log('[DB] MongoDB not available, running without persistence');
+    }
+    
+    httpServer.listen(PORT, () => {
+        console.log(`Server running on port ${PORT}`);
+        
+        // Try to resume tracking after server starts
+        // Will wait for connections to be established
+        setTimeout(() => {
+            if (!resumeAttempted && (isWhatsAppConnected || isSignalConnected)) {
+                tryResumeTracking();
+            }
+        }, 10000); // Initial wait of 10 seconds
+    });
 });
